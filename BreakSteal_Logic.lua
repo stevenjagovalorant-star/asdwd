@@ -17,7 +17,7 @@
 
 local ctx = loadstring(game:HttpGet("https://raw.githubusercontent.com/lampumenyala/blablabla/refs/heads/main/TemplateUi.lua"))()({
     Name        = "Break and Steal an Egg",
-    Version     = "3.0.1",
+    Version     = "3.0.2",
     Folder      = "RooxHub",
     GlobalFlag  = "RooxHub_BSv2_Running",
     CleanupFlag = "RooxHub_BSv2_Cleanup",
@@ -102,10 +102,14 @@ local Config = {
     EggPriority = "Nearest",
     -- Egg Type filter: only break eggs whose EggType is in this set. Empty = all.
     EggTypeFilter = {},
-    -- Pet collection filter for Auto Break / Auto Steal Player: by RARITY now
+    -- Pet collection filter for Auto Break / Auto Steal: by RARITY now
     -- (was by name). Empty = collect every rarity. INDEX_FILTER (Auto Complete
     -- Index) still overrides it.
     PetRarityFilter = {},
+    -- Mutation filter for Auto Break / Auto Steal: collect only pets whose
+    -- "Mutation" attribute is in this set. Empty = every mutation. The special
+    -- "None" entry matches pets with no Mutation attribute.
+    MutationFilter = {},
     AutoStealMinIncome = 0,
     -- Final delivery spot (hardcoded, inside the SafeZone): after a successful
     -- force-pickup in the target zone the pet is force-TP'd here and the server
@@ -132,6 +136,9 @@ local Config = {
     HuntGuardHits = 1,
     AutoTreadmill = false,
     AutoUpgradePickaxe = false,
+    -- Pickaxe upgrade multi-select filter (Upgrade tab). Empty = never upgrade.
+    -- Only the NEXT tier is bought, and only when its name is selected here.
+    PickaxeUpgradeFilter = {},
     AutoUpgradeTreadmill = false,
     AutoUpgradePlot = false,
     AutoUpgradeTrail = false,
@@ -205,6 +212,7 @@ local ZONES = {
     { Name = "Planet X", Id = "Zone10" },
     { Name = "Haunted Graveyard", Id = "Zone11" },
     { Name = "Fairy Castle", Id = "Zone12" },
+    { Name = "Fantasy Expansion", Id = "Zone13" },
 }
 local ZONE_ID = {}
 local ZONE_NAMES = { "Semua" }
@@ -247,7 +255,7 @@ table.sort(EGG_TYPE_VALUES)
 -- Rarity filter values (high -> low) for the Auto Farm "Filter by Rarity" dropdown.
 -- The full ladder, including Void, Omega & Ethereal (which the old RARITIES list omitted).
 local PET_RARITY_VALUES = {
-    "Ethereal", "Spectral", "Omega", "Void", "Inferno", "Celestial", "Secret", "Cosmic", "Divine",
+    "Primordial", "Ethereal", "Spectral", "Omega", "Void", "Inferno", "Celestial", "Secret", "Cosmic", "Divine",
     "Mythic", "Legendary", "Epic", "Rare", "Uncommon", "Common",
 }
 
@@ -259,15 +267,24 @@ local INDEX_FILTER = { Missing = nil, ZoneId = nil }
 -- forward-declared here so petAllowed can call it.
 local rarityOfName
 -- Pet allowed for collection: Auto Complete Index wins, then the RARITY filter
--- (Config.PetRarityFilter); empty filter = every rarity allowed.
-local function petAllowed(name)
+-- (Config.PetRarityFilter), then the MUTATION filter (Config.MutationFilter).
+-- Empty filters = everything allowed. In the mutation filter, "None" matches a
+-- pet whose Mutation attribute is nil.
+local function petAllowed(name, mut)
     if INDEX_FILTER.Missing then
         return name ~= nil and INDEX_FILTER.Missing[name] == true
     end
     local rf = Config.PetRarityFilter
-    if not rf or next(rf) == nil then return true end
-    local r = name ~= nil and rarityOfName and rarityOfName(name) or nil
-    return r ~= nil and rf[r] == true
+    if rf and next(rf) ~= nil then
+        local r = name ~= nil and rarityOfName and rarityOfName(name) or nil
+        if not (r ~= nil and rf[r] == true) then return false end
+    end
+    local mf = Config.MutationFilter
+    if mf and next(mf) ~= nil then
+        if mut == nil then return mf["None"] == true end
+        return mf[mut] == true
+    end
+    return true
 end
 
 local ZoneHitboxLookup = nil
@@ -428,11 +445,11 @@ end
 
 local RARITIES = {
     "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic",
-    "Divine", "Cosmic", "Secret", "Celestial", "Inferno", "Void", "Omega", "Spectral", "Ethereal",
+    "Divine", "Cosmic", "Secret", "Celestial", "Inferno", "Void", "Omega", "Spectral", "Ethereal", "Primordial",
 }
 
 local RARITIES_DESC = {
-    "Ethereal", "Spectral", "Omega", "Void", "Inferno", "Celestial", "Secret", "Cosmic", "Divine", "Mythic",
+    "Primordial", "Ethereal", "Spectral", "Omega", "Void", "Inferno", "Celestial", "Secret", "Cosmic", "Divine", "Mythic",
     "Legendary", "Epic", "Rare", "Uncommon", "Common",
 }
 
@@ -481,7 +498,7 @@ local RARITY_COLORS = {
     Common = 9807270, Uncommon = 3066993, Rare = 3447003, Epic = 10181046,
     Legendary = 16744448, Mythic = 16711680, Divine = 16766720, Cosmic = 10181046,
     Secret = 16724735, Celestial = 15844367, Inferno = 15158332, Spectral = 5635925,
-    Void = 9848575, Omega = 4652920, Ethereal = 16752870,
+    Void = 9848575, Omega = 4652920, Ethereal = 16752870, Primordial = 4645280,
 }
 local petThumbCache = {}
 
@@ -990,19 +1007,65 @@ Runtime.zoneAnchorPoint = function(id)
     return nil
 end
 
--- One-shot streaming prefetch for a target zone. The user only needs a zone
--- streamed ONCE: after that its content stays available while we are there.
--- Requesting it every tick spawned threads constantly and caused lag, so a zone
--- id is requested exactly once per session (ZoneStreamedFor) and never retried.
+-- STREAMING PREFETCH (with retry + verify).
+-- Far zones (e.g. Fantasy Expansion / Zone13) sit beyond Workspace.StreamingTargetRadius
+-- from the SafeZone, so they stay EMPTY until explicitly requested. A single
+-- RequestStreamAroundAsync can time out, so it must be RETRIED until the zone's
+-- content actually appears - and never be marked done before that.
+-- zoneStreamAnchor: request point that does NOT depend on streamed ground (the
+-- static zone hitbox centre / build pivot), because a far zone has no floor/eggs
+-- before it streams.
+Runtime.zoneStreamAnchor = function(id)
+    local n = zoneIndexFromId(id)
+    if not n then return nil end
+    local build = Workspace:FindFirstChild("Build")
+    local hb = build and build:FindFirstChild("ZoneHitboxes")
+    local h = hb and hb:FindFirstChild(tostring(n))
+    if h and h:IsA("BasePart") then return h.Position end
+    local z = zoneBuild(id)
+    return z and z:GetPivot().Position or nil
+end
+
+-- zoneHasContent: the zone's Eggs folder only gains children after its content
+-- streams in (far zones start with an EMPTY Eggs folder under StreamingEnabled).
+Runtime.zoneHasContent = function(id)
+    local z = zoneBuild(id)
+    local eggs = z and z:FindFirstChild("Eggs")
+    if eggs and #eggs:GetChildren() > 0 then return true end
+    -- Already physically inside the zone (or standing where its hitbox is): its
+    -- content is up, even if every egg is momentarily broken/respawning.
+    local ch = LocalPlayer.Character
+    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    if hrp and zoneOfPosition(hrp.Position) == id then return true end
+    return false
+end
+
+Runtime.ZoneStreamState = Runtime.ZoneStreamState or {}
 Runtime.requestZoneStream = function(id, timeout)
     if not id then return false end
-    if Runtime.ZoneStreamedFor == id then return false end
-    Runtime.ZoneStreamedFor = id
-    local z = zoneBuild(id)
-    local anchor = Runtime.zoneAnchorPoint(id) or (z and z:GetPivot().Position)
+    local st = Runtime.ZoneStreamState[id]
+    if st and st.Done then return false end
+    if Runtime.zoneHasContent(id) then
+        Runtime.ZoneStreamState[id] = { Done = true, At = os.clock(), Tries = 0 }
+        return false
+    end
+    if not st then
+        st = { Done = false, At = 0, Tries = 0, InFlight = false }
+        Runtime.ZoneStreamState[id] = st
+    end
+    if st.InFlight then return false end
+    local now = os.clock()
+    if now - (st.At or 0) < 2.0 then return false end
+    st.At = now
+    st.Tries = (st.Tries or 0) + 1
+    local anchor = Runtime.zoneStreamAnchor(id)
     if not anchor then return false end
+    st.InFlight = true
     task.spawn(function()
-        pcall(function() LocalPlayer:RequestStreamAroundAsync(anchor, timeout or 3) end)
+        pcall(function() LocalPlayer:RequestStreamAroundAsync(anchor, timeout or 10) end)
+        task.wait(0.5)
+        st.InFlight = false
+        if Runtime.zoneHasContent(id) then st.Done = true end
     end)
     return true
 end
@@ -2048,13 +2111,11 @@ Runtime.huntResetCycle = function()
     Runtime.HuntRegrabAt = 0
     Runtime.WalkGuardAt = 0
     Runtime.LastStealAttempt = 0
-    -- respawn relocation (new HUNT opening: kill -> respawn -> pin onto the target)
+    -- respawn relocation (drop-only: kill -> respawn -> pin onto the drop)
     Runtime.HuntRespawnPending = false
     Runtime.HuntRespawnAt = 0
-    -- exactly ONE self-respawn per HUNT phase
     Runtime.HuntRespawned = false
     Runtime.HuntSpawnPos = nil
-    -- respawn relocation verification state
     Runtime.HuntRelocPos = nil
     Runtime.HuntRelocAt = 0
     Runtime.HuntRelocTries = 0
@@ -2234,7 +2295,7 @@ Runtime.onGuardHit = metaOnGuardHit
 local function nearestPickupNear(center, radius)
     local best, bd = nil, radius or math.huge
     for _, p in ipairs(livePickups()) do
-        if petAllowed(p:GetAttribute("AnimalName")) then
+        if petAllowed(p:GetAttribute("AnimalName"), p:GetAttribute("Mutation")) then
             local m = (p:GetPivot().Position - center).Magnitude
             if m < bd then bd = m; best = p end
         end
@@ -2321,8 +2382,17 @@ end
 
 local function tryUpgradePickaxe()
     if not (PickaxeConfig and PickaxeShopRequest) then return end
+    -- Multi-select filter: empty = never upgrade. Only buy the NEXT tier when the
+    -- user has explicitly selected that pickaxe; anything not selected is skipped.
+    -- The game only sells tier+1, so a selected higher tier also needs the tiers
+    -- below it selected to be reached.
+    local filter = Config.PickaxeUpgradeFilter
+    if not filter or next(filter) == nil then return end
     local tier = LocalPlayer:GetAttribute("PickaxeTier") or PickaxeConfig.DefaultTier
     if tier >= #PickaxeConfig.Tiers then return end
+    local nextTier = PickaxeConfig.Tiers[tier + 1]
+    local nextName = type(nextTier) == "table" and nextTier.Name or nil
+    if not nextName or filter[nextName] ~= true then return end
     local price = PickaxeConfig.GetPrice(tier + 1)
     if type(price) == "number" and price > 0 and cash() >= price then
         buyNextPickaxe()
@@ -2657,71 +2727,28 @@ local function huntBetter(inc, dist, bestInc, bestDist)
     return false
 end
 
+-- AUTO STEAL (DROP-ONLY): the target is always a dropped AnimalPickup on the
+-- ground (never a player-carried pet). Picks the highest-income drop that passes
+-- the income minimum + rarity filter + mutation filter.
 local function findHuntTarget(pos)
     local need = tonumber(Config.AutoStealMinIncome) or 0
-    local kind, subj, bd = nil, nil, math.huge
+    local best, bd = nil, math.huge
     local bestInc = nil
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer then
-            local cname = p:GetAttribute("Carrying")
-            if cname and isPlayerCarrying(p) and petAllowed(cname) then
-                local inc = petIncomeFor(cname)
-                if inc >= need and inc > 0 then
-                    local ch = p.Character
-                    local phrp = ch and ch:FindFirstChild("HumanoidRootPart")
-                    local phum = ch and ch:FindFirstChildOfClass("Humanoid")
-                    if phrp and phum and phum.Health > 0 and not inSafeZone(phrp.Position) then
-                        local m = (phrp.Position - pos).Magnitude
-                        if huntBetter(inc, m, bestInc, bd) then
-                            bestInc = inc; bd = m; kind = "PLAYER"; subj = p
-                        end
-                    end
-                end
-            end
-        end
-    end
     if Runtime.pickupIncome then
         for _, pick in ipairs(livePickups()) do
             local pname = pick:GetAttribute("AnimalName")
-            if pname and petAllowed(pname) then
+            if pname and petAllowed(pname, pick:GetAttribute("Mutation")) then
                 local inc = Runtime.pickupIncome(pick)
                 if inc >= need and inc > 0 then
                     local m = (pick:GetPivot().Position - pos).Magnitude
                     if huntBetter(inc, m, bestInc, bd) then
-                        bestInc = inc; bd = m; kind = "DROP"; subj = pick
+                        bestInc = inc; bd = m; best = pick
                     end
                 end
             end
         end
     end
-    return kind, subj, bd
-end
-
--- Find a player now CARRYING a pet matching `name` (or any qualifying pet when
--- name is nil), live and outside the SafeZone. Used when a ground drop we were
--- after gets picked up by someone else: switch to that carrier and attack it
--- instead of idling. Returns the nearest such player and the distance.
-local function findHuntCarrier(name, pos)
-    local need = tonumber(Config.AutoStealMinIncome) or 0
-    local best, bd = nil, math.huge
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer then
-            local cname = p:GetAttribute("Carrying")
-            if cname and (name == nil or cname == name) and isPlayerCarrying(p) and petAllowed(cname) then
-                local inc = petIncomeFor(cname)
-                if inc >= need and inc > 0 then
-                    local ch = p.Character
-                    local phrp = ch and ch:FindFirstChild("HumanoidRootPart")
-                    local phum = ch and ch:FindFirstChildOfClass("Humanoid")
-                    if phrp and phum and phum.Health > 0 and not inSafeZone(phrp.Position) then
-                        local m = (phrp.Position - pos).Magnitude
-                        if m < bd then bd = m; best = p end
-                    end
-                end
-            end
-        end
-    end
-    return best, bd
+    return "DROP", best, bd
 end
 
 -- HUNT pickup selector: never grabs an arbitrary pet. It matches the INTENDED pet
@@ -2738,7 +2765,8 @@ Runtime.huntPickupFor = function(center, radius, wantName, ignore)
     if wantName then
         local best, bd = nil, r
         for _, p in ipairs(livePickups()) do
-            if ok(p) and p:GetAttribute("AnimalName") == wantName then
+            if ok(p) and p:GetAttribute("AnimalName") == wantName
+                and petAllowed(p:GetAttribute("AnimalName"), p:GetAttribute("Mutation")) then
                 local m = (p:GetPivot().Position - center).Magnitude
                 if m < bd then bd = m; best = p end
             end
@@ -2746,10 +2774,10 @@ Runtime.huntPickupFor = function(center, radius, wantName, ignore)
         if best then return best end
     end
     -- no name match: highest income at/above the minimum (never below-min), and
-    -- still respecting the rarity filter (never grab an off-filter rarity).
+    -- still respecting the rarity + mutation filters (never grab an off-filter pet).
     local best, bestInc, bestDist = nil, nil, math.huge
     for _, p in ipairs(livePickups()) do
-        if ok(p) and petAllowed(p:GetAttribute("AnimalName")) then
+        if ok(p) and petAllowed(p:GetAttribute("AnimalName"), p:GetAttribute("Mutation")) then
             local inc = Runtime.pickupIncome and Runtime.pickupIncome(p) or 0
             if inc >= need and inc > 0 then
                 local m = (p:GetPivot().Position - center).Magnitude
@@ -2762,56 +2790,8 @@ Runtime.huntPickupFor = function(center, radius, wantName, ignore)
     return best
 end
 
-local function equipBat()
-    local c, _, hum = getChar()
-    if not c or not hum then return end
-    local cur = c:FindFirstChildOfClass("Tool")
-    if cur and cur.Name == "Bat" then return end
-    local bp = LocalPlayer:FindFirstChild("Backpack")
-    if not bp then return end
-    local fallback = nil
-    for _, t in ipairs(bp:GetChildren()) do
-        if t:IsA("Tool") and t.Name == "Bat" then
-            if not CollectionService:HasTag(t, "AnimalTool") then
-                pcall(function() hum:EquipTool(t) end)
-                return
-            elseif not fallback then
-                fallback = t
-            end
-        end
-    end
-    if fallback then
-        pcall(function() hum:EquipTool(fallback) end)
-    end
-end
-
-local function fireBat(target)
-    if BatHitRequest and target then
-        pcall(function() BatHitRequest:FireServer(target) end)
-    end
-end
-
---------------------------------------------------------------------------------
--- AUTO STEAL PLAYER (HUNT): direct TP + FORCE hit.
--- A step move can NEVER stay glued to a moving target - the game movement
--- controller overrides our motion, so the only way to keep up is to PIN our HRP
--- onto them (client CFrame).
--- We therefore TP straight onto the target and FORCE the bat hit the instant we
--- are on them (no approach delay) so they ragdoll. The SafeZone delivery still
--- needs a hit window (guard catch / ragdoll), which BAIT/RECOVER provides.
---------------------------------------------------------------------------------
--- The game's own BatController module (so we can drive its swing/animation).
-Runtime.huntBatController = function()
-    if not Runtime.BatController then
-        pcall(function()
-            local ps = LocalPlayer:FindFirstChild("PlayerScripts")
-            local m = ps and ps:FindFirstChild("BatController", true)
-            if m then Runtime.BatController = require(m) end
-        end)
-    end
-    return Runtime.BatController
-end
--- Forced-TP pin (mirror of the META pin, kept SEPARATE so the META is untouched).
+-- Forced-TP pin used by the drop-only HUNT relocation (self-kill -> respawn ->
+-- pin onto the dropped pet). Kept SEPARATE from the META pin.
 local function huntForceStep()
     if not Runtime.HuntForcePos then return end
     if os.clock() > (Runtime.HuntForceUntil or 0) or not Runtime.HuntForcePin then
@@ -2828,9 +2808,7 @@ local function huntForceStep()
         floorAir = h and h.FloorMaterial == Enum.Material.Air
     end)
     -- MINIMUM HOLD: never release merely because we touched down. A respawn jump
-    -- lands for a single frame and, with the character server-authoritative, the
-    -- server reconciliation then pulls us straight back to the game's spawn. Keep
-    -- forcing position+velocity until HuntForceMinUntil has passed.
+    -- lands for a single frame and the server reconciliation then pulls us back.
     if os.clock() < (Runtime.HuntForceMinUntil or 0) then
         pcall(function() hrp.CFrame = CFrame.new(Runtime.HuntForcePos) end)
         pcall(function()
@@ -2863,7 +2841,6 @@ Runtime.huntForceTp = function(pos, yoff, hold)
     local dest = pos + Vector3.new(0, yoff or 2, 0)
     Runtime.HuntForcePos = dest
     Runtime.HuntForceUntil = os.clock() + (hold or 2.0)
-    -- cannot release-on-landing before this (see huntForceStep)
     Runtime.HuntForceMinUntil = os.clock() + math.min(hold or 2.0, 0.7)
     Runtime.HuntForcePin = true
     pcall(function() RunService:BindToRenderStep("BSHuntForce", Enum.RenderPriority.Character.Value - 1, huntForceStep) end)
@@ -2874,48 +2851,6 @@ Runtime.huntForceTp = function(pos, yoff, hold)
     end)
     return true
 end
-
-local HUNT_FORCE_HIT_CD = 0.12
-local function huntLockStep()
-    -- BAT only: after the respawn-spawn we sit on the carrying player and swing the
-    -- bat until they drop the pet. Prefer the game's own BatController (legit swing,
-    -- honours its 0.6s client cooldown); fire the raw remote only as a fallback.
-    if not getgenv()[GAME_CONFIG.GlobalFlag] then return end
-    if Runtime.Phase ~= "HUNT" or Runtime.HuntStage ~= "BAT" then return end
-    if Runtime.HuntKind ~= "PLAYER" then return end
-    local player = Runtime.HuntTarget
-    local ch = player and player.Character
-    local thrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    local _, hrp, hum = getChar()
-    if not (player and player.Parent and thrp and hrp and hum and hum.Health > 0) then return end
-
-    -- pin onto the player (release-on-landing inside huntForceStep), re-issuing only
-    -- when they have moved off the pin or we are still far from them.
-    local goal = thrp.Position + Vector3.new(0, 2, 0)
-    local moved = Runtime.HuntForcePos and (Runtime.HuntForcePos - goal).Magnitude > 6
-    local far = (hrp.Position - goal).Magnitude > 6
-    if moved or far then
-        Runtime.huntForceTp(thrp.Position, 2, 0.8)
-    end
-    Runtime.HuntPos = thrp.Position
-
-    equipBat()
-    if ch and not (ch:GetAttribute("Ragdolled") or ch:GetAttribute("BatImmune")) then
-        local BC = Runtime.huntBatController()
-        if BC and type(BC.Swing) == "function" then
-            pcall(function() BC.Swing() end)
-            Runtime.BatSwings = (Runtime.BatSwings or 0) + 1
-        else
-            local now = os.clock()
-            if now - (Runtime.LastBat or 0) >= HUNT_FORCE_HIT_CD then
-                Runtime.LastBat = now
-                fireBat(player)
-                Runtime.BatSwings = (Runtime.BatSwings or 0) + 1
-            end
-        end
-    end
-end
-getgenv().__bsthuntlock = huntLockStep
 
 local function backpackTools()
     local bp = LocalPlayer:FindFirstChild("Backpack")
@@ -3347,7 +3282,7 @@ local function bestMinIncomePickup(center, radius)
         -- (the income minimum must not block collecting an Index pet).
         local best, bd = nil, math.huge
         for _, p in ipairs(livePickups()) do
-            if petAllowed(p:GetAttribute("AnimalName")) then
+            if petAllowed(p:GetAttribute("AnimalName"), p:GetAttribute("Mutation")) then
                 local m = (p:GetPivot().Position - center).Magnitude
                 if m <= r and m < bd then bd = m; best = p end
             end
@@ -3358,7 +3293,7 @@ local function bestMinIncomePickup(center, radius)
     local best, bestInc = nil, need
     for _, p in ipairs(livePickups()) do
         local m = (p:GetPivot().Position - center).Magnitude
-        if m <= r and petAllowed(p:GetAttribute("AnimalName")) then
+        if m <= r and petAllowed(p:GetAttribute("AnimalName"), p:GetAttribute("Mutation")) then
             local inc = pickupIncome(p)
             if inc >= bestInc and inc > 0 then
                 bestInc = inc; best = p
@@ -3792,26 +3727,26 @@ Runtime.decoyEntryStep = function(now)
 
     elseif stage == "HOP" then
         walkStop()   -- halt the genuine walk engine before the instant hop
+        -- Keep the streaming prefetch alive: it retries until the zone's content
+        -- actually appears (Fantasy Expansion / Zone13 starts empty until streamed).
+        if targetZone and Runtime.requestZoneStream then Runtime.requestZoneStream(targetZone) end
         local egg = nearestEggInZone(pos, targetZone) or firstEggInZone(targetZone)
         -- TP v1 with filter "Semua" (no target zone): hop to the nearest egg anywhere.
         if not egg and isV1() then egg = nearestEgg(pos) end
-        -- Far-zone eggs are NOT in the client's Eggs folder until the zone is
-        -- streamed in. When that is the case, hop to the zone's GROUNDED entry
-        -- point instead: reaching it makes the zone (and its eggs) stream in, and
-        -- the META then picks an egg normally. Never clear the decoy without a
-        -- destination, or the character strands in Zone1 after the catch.
         local dest = egg and egg.Position
-        if not dest and targetZone then
-            if Runtime.requestZoneStream then Runtime.requestZoneStream(targetZone) end
-            dest = Runtime.zoneAnchorPoint(targetZone)
-        end
-        if dest then
+        if not dest and targetZone then dest = Runtime.zoneAnchorPoint(targetZone) end
+        -- Never hop into a far zone whose content has NOT streamed: the server pulls
+        -- the relocation back and the zone never loads (the Zone13 dead-lock).
+        local streamed = (not targetZone) or (egg ~= nil)
+            or (Runtime.zoneHasContent and Runtime.zoneHasContent(targetZone))
+        if dest and streamed then
             -- inside the hitguard window: instant TP to the far zone
             if Runtime.inWindow(0.2) then
                 Runtime.Leap(dest)
             else
                 Runtime.instantTp(dest)
             end
+            Runtime.DecoyStreamStart = nil
             Runtime.TargetEgg = egg
             Runtime.DecoyStage = nil
             Runtime.DecoyDoneZone = targetZone
@@ -3821,10 +3756,19 @@ Runtime.decoyEntryStep = function(now)
             Runtime.MetaWalkEntry = false
             Runtime.MetaStage = "BREAK"
             Runtime.MetaStageAt = now
+        elseif targetZone and now - (Runtime.DecoyStreamStart or now) < 90 then
+            -- Not streamed yet: restart the Zone 1 decoy so the NEXT hop has a FRESH
+            -- catch window, while streaming keeps retrying in the background.
+            Runtime.DecoyStreamStart = Runtime.DecoyStreamStart or now
+            Runtime.DecoyStage = "GOTO1"
+            Runtime.DecoyStageAt = now
+            Runtime.DecoyEgg = nil
+            Runtime.DecoyPick = nil
+            Runtime.DecoyPulled = false
+            Runtime.DecoyHOPAt = nil
         else
-            -- No egg and no usable anchor: do NOT retry the decoy from the start.
-            -- Hand off to TRAVEL with MetaWalkEntry so the character walks toward
-            -- the zone; the anchor wait there picks the eggs up once streamed.
+            -- No destination / streaming stalled: walk-entry fallback.
+            Runtime.DecoyStreamStart = nil
             Runtime.DecoyStage = nil
             Runtime.DecoyDoneZone = targetZone
             Runtime.DecoyPulled = false
@@ -3890,11 +3834,10 @@ getgenv().__bsHuntSelfCheck = function()
     local keep = Runtime.HuntStage
     Runtime.huntResetCycle()
     assert(Runtime.HuntStage == "ACQUIRE", "huntResetCycle must start at ACQUIRE")
-    assert(Runtime.HuntRespawnPending == false, "respawn flag must be clear after reset")
     local c = Connections.HuntCharAdded
     assert(c ~= nil and typeof(c) == "RBXScriptConnection", "HuntCharAdded not connected")
     Runtime.HuntStage = keep
-    return { ok = true, startStage = "ACQUIRE", respawnHandler = true }
+    return { ok = true, startStage = "ACQUIRE" }
 end
 
 -- Hide the LOCAL body for a short window so the ragdoll "getar" during the banking
@@ -4184,14 +4127,9 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
 
     local c, hrp, hum = getChar()
     if not hrp or not hum or hum.Health <= 0 then
-        -- keep a HUNT cycle alive across a death while we are still trying to
-        -- reach/steal the target (the planned RESPAWN relocation OR a mid-attempt
-        -- death at the pet). The CharacterAdded handler re-pins us and continues;
-        -- this never triggers a fresh self-respawn.
-        local st = Runtime.HuntStage
+        -- keep the drop-only HUNT cycle alive across a death: the fresh character
+        -- resumes the pickup/bank stage machine (no self-respawn any more).
         local keepHunt = Runtime.Phase == "HUNT"
-            and (Runtime.HuntRespawnPending
-                or st == "ACQUIRE" or st == "RESPAWN" or st == "BAT" or st == "PICKUP")
         -- keep the META (TP) cycle alive across a death/respawn: the stage machine
         -- resumes from TRAVEL on the fresh character (no self-kill any more).
         local keepMeta = Runtime.Phase == "META"
@@ -4253,8 +4191,8 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- HUNT CHASE/HIT combat is driven frame-accurately by huntLockStep
-    -- (BSHuntLock); the feature loop only book-keeps the stage machine below.
+    -- Drop-only Auto Steal has no chase/bat combat; the stage machine below just
+    -- picks up matching drops and banks them.
 
     local tick = os.clock()
     if tick - Runtime.LastTick < 0.15 then return end
@@ -4373,9 +4311,8 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
         local metaActive = Config.AutoSteal and Config.FarZoneMeta
             and (isTPMode() or isFarZoneFilter() or titanicEgg ~= nil)
         local wantPhase, wantHunt, wantHuntKind = nil, nil, nil
-        -- HUNT (Auto Steal Player) has absolute priority across ALL zones: a pet
-        -- whose income >= AutoStealMinIncome, whether CARRIED by a player or lying
-        -- on the ground as a drop. One unified target. Never in Walk mode.
+        -- AUTO STEAL (drop-only): a dropped AnimalPickup whose income, rarity and
+        -- mutation pass the filters. Never chases a player. Never in Walk mode.
         if not walkMode and Config.AutoStealPlayer and now >= (Runtime.HuntCoolUntil or 0)
             and (phaseNow == "IDLE" or phaseNow == "BREAK" or phaseNow == "PICKUP") then
             local k, subj = findHuntTarget(pos)
@@ -4384,8 +4321,8 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                 wantHunt = subj
                 wantHuntKind = k
                 Runtime.HuntKind = k
-                Runtime.HuntTarget = (k == "PLAYER") and subj or nil
-                Runtime.HuntDropTarget = (k == "DROP") and subj or nil
+                Runtime.HuntTarget = nil
+                Runtime.HuntDropTarget = subj
             end
         end
         if not wantPhase then
@@ -4419,10 +4356,9 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
             else
                 if wantPhase == "HUNT" then
                     if phaseNow ~= "HUNT" then
-                        -- New HUNT opening: latch the target, then self-respawn onto
-                        -- it (ACQUIRE -> RESPAWN -> BAT/PICKUP). huntResetCycle clears
-                        -- everything (including the target picked above), so re-apply
-                        -- the freshly chosen target afterwards.
+                        -- New HUNT opening (drop-only): latch the dropped pet and go
+                        -- ACQUIRE -> PICKUP. huntResetCycle clears everything
+                        -- (including the target picked above), so re-apply it after.
                         local k, subj = wantHuntKind, wantHunt
                         Runtime.huntResetCycle()
                         Runtime.HuntKind = k
@@ -4624,9 +4560,8 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
             Runtime.PendingHunt = nil
             Runtime.PendingHuntKind = nil
             if p == "HUNT" and ph then
-                -- Full HUNT re-init (mirror the direct entry): reset every transient
-                -- field so RESPAWN self-kills again on entry instead of reusing a
-                -- stale HuntRespawned/reloc timer and skipping straight to the TP.
+                -- Full drop-only HUNT re-init (mirror the direct entry): reset every
+                -- transient field, then re-latch the queued drop target.
                 Runtime.huntResetCycle()
                 Runtime.HuntKind = pk
                 Runtime.HuntTarget = (pk == "PLAYER") and ph or nil
@@ -4714,78 +4649,49 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
             end
         end
     elseif Runtime.Phase == "HUNT" then
-        local kind = Runtime.HuntKind
         local stage = Runtime.HuntStage or "ACQUIRE"
 
         if stage == "ACQUIRE" then
-            -- Latch what we are stealing (player-carried pet OR ground drop) and
-            -- where the target is, then relocate onto it by self-respawn.
-            local subj = (kind == "PLAYER") and Runtime.HuntTarget or Runtime.HuntDropTarget
-            local tpos, cname, valid = nil, nil, false
-            if kind == "PLAYER" and subj and subj.Parent then
-                local tch = subj.Character
-                local thrp = tch and tch:FindFirstChild("HumanoidRootPart")
-                local thum = tch and tch:FindFirstChildOfClass("Humanoid")
-                if thrp and thum and thum.Health > 0 and not inSafeZone(thrp.Position) then
-                    tpos = thrp.Position
-                    cname = subj:GetAttribute("Carrying")
-                    valid = cname ~= nil
-                end
-            elseif kind == "DROP" and subj then
-                -- read the pet name even if the drop just vanished (still readable)
-                cname = subj:GetAttribute("AnimalName")
-                captureHuntPetInfo(subj, cname)
-                if subj.Parent and not subj:GetAttribute("Despawning") then
-                    tpos = subj:GetPivot().Position
-                    valid = true
-                end
-            end
-            if not valid then
-                -- The drop was picked up by another player: chase the carrier at once
-                -- instead of resetting (kill -> TP -> bat on the new carrier).
-                local carrier = cname and findHuntCarrier(cname, pos) or nil
-                if carrier then
-                    local cch = carrier.Character
-                    local chrp = cch and cch:FindFirstChild("HumanoidRootPart")
-                    Runtime.HuntKind = "PLAYER"
-                    Runtime.HuntTarget = carrier
-                    Runtime.HuntDropTarget = nil
-                    Runtime.HuntCarried = cname
-                    Runtime.HuntSpawnPos = chrp and chrp.Position or pos
-                    Runtime.HuntPos = Runtime.HuntSpawnPos
-                    Runtime.HuntRecoverPick = nil
-                    Runtime.HuntGuardHits = 0
-                    Runtime.GuardHitAt = 0; Runtime.GuardHitState = nil
-                    Runtime.HuntStage = "BAT"; Runtime.HuntStageAt = now
-                    dbg("HUNT", "ACQUIRE drop gone -> chase carrier " .. tostring(carrier.Name))
-                else
-                    Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
-                end
+            -- Drop-only: latch the dropped AnimalPickup we are going to collect.
+            local subj = Runtime.HuntDropTarget
+            local cname = subj and subj:GetAttribute("AnimalName") or nil
+            if subj then captureHuntPetInfo(subj, cname) end
+            if not (subj and subj.Parent and not subj:GetAttribute("Despawning")) then
+                Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
             else
+                local tpos = subj:GetPivot().Position
                 Runtime.HuntCarried = cname
                 Runtime.HuntPos = tpos
                 Runtime.HuntSpawnPos = tpos
-                Runtime.HuntPetZone = zoneOfPosition(tpos)
+                -- Prefer the drop's own replicated zone; fall back to the position.
+                Runtime.HuntPetZone = subj:GetAttribute("ZoneId") or zoneOfPosition(tpos)
                 Runtime.HuntRecoverPick = nil
                 Runtime.HuntRecoverSeen = nil
                 Runtime.HuntRecoverEntryCarried = false
                 Runtime.HuntRecoverPicked = false
                 Runtime.LastStealAttempt = 0
                 Runtime.HuntGuardHits = 0
+                Runtime.GuardHitAt = 0; Runtime.GuardHitState = nil
+                -- Relocate by self-respawn + pin onto the drop (no walking across
+                -- the map, no player locking).
+                Runtime.HuntRespawned = false
                 Runtime.HuntRespawnPending = false
                 Runtime.HuntRespawnAt = 0
-                Runtime.GuardHitAt = 0; Runtime.GuardHitState = nil
+                Runtime.HuntRelocPos = tpos
+                Runtime.HuntRelocAt = 0
+                Runtime.HuntRelocTries = 0
+                Runtime.HuntRelocDone = false
+                Runtime.HuntRelocStart = 0
+                Runtime.HuntRelocDest = nil
                 Runtime.HuntStage = "RESPAWN"; Runtime.HuntStageAt = now
-                dbg("HUNT", ("ACQUIRE %s pet=%s zone=%s"):format(
-                    tostring(kind), tostring(cname), tostring(Runtime.HuntPetZone)))
+                dbg("HUNT", ("ACQUIRE drop pet=%s zone=%s"):format(
+                    tostring(cname), tostring(Runtime.HuntPetZone)))
             end
         elseif stage == "RESPAWN" then
-            -- Self-respawn ONCE, then pin onto the target and VERIFY the move the
-            -- same way the far-zone META does: the pin is (re)issued until we
-            -- actually SETTLE on the destination, so a server pull-back re-pins
-            -- instead of stranding us at the game's own spawn.
+            -- Drop-only relocation: self-kill ONCE, then pin onto the dropped pet
+            -- and VERIFY the move (re-pin if the server pulls us back). No player
+            -- locking - the destination is always the ground drop.
             local _, hrp0, hum0 = getChar()
-            -- 1) First entry: latch the destination and self-kill once.
             if not Runtime.HuntRespawned then
                 if hum0 and hum0.Health > 0 then
                     Runtime.HuntRespawned = true
@@ -4806,7 +4712,6 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                 end
                 return
             end
-            -- 2) Wait for the fresh character to replicate (respawn in progress).
             if not hrp0 then
                 if now - (Runtime.HuntRelocStart or now) > 8 then
                     Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
@@ -4814,16 +4719,12 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                 return
             end
             if Runtime.HuntRelocStart == 0 then Runtime.HuntRelocStart = now end
-            -- keep the destination fresh (carrier / drop may have moved since ACQUIRE)
+            -- keep the destination fresh (the drop may still be on the ground)
             local spawn = Runtime.HuntRelocPos
-            if Runtime.HuntKind == "PLAYER" then
-                local pl = Runtime.HuntTarget
-                local tch = pl and pl.Character
-                local thrp = tch and tch:FindFirstChild("HumanoidRootPart")
-                if thrp then spawn = thrp.Position; Runtime.HuntRelocPos = spawn end
-            elseif Runtime.HuntKind == "DROP" then
-                local drop = Runtime.HuntDropTarget
-                if drop and drop.Parent then spawn = drop:GetPivot().Position; Runtime.HuntRelocPos = spawn end
+            local drop = Runtime.HuntDropTarget
+            if drop and drop.Parent and not drop:GetAttribute("Despawning") then
+                spawn = drop:GetPivot().Position
+                Runtime.HuntRelocPos = spawn
             end
             spawn = spawn or Runtime.HuntSpawnPos or Runtime.HuntPos
             if not spawn then
@@ -4837,11 +4738,8 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                 Runtime.HuntRelocAt = now
                 Runtime.HuntRelocTries = (Runtime.HuntRelocTries or 0) + 1
             end
-            -- DROP target: the pin has put us ON the drop, so grab it AT ONCE -
-            -- forcePickupInstant has no distance gate. No waiting for the settle
-            -- window and no walk-in. On success release the pin so WALK_GUARD can
-            -- move, and hand off to PICKUP (which walks to the guard).
-            if Runtime.HuntKind == "DROP" and not isCarrying() then
+            -- The pin put us ON the drop: grab it at once (no distance gate).
+            if not isCarrying() then
                 local pick = Runtime.HuntDropTarget
                 if pick and pick.Parent and not pick:GetAttribute("Despawning") then
                     if now - (Runtime.LastStealAttempt or 0) > 0.05 then
@@ -4856,15 +4754,12 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                     end
                 end
             end
-            -- The pin HELD if we are still near the point it was issued to. Compare
-            -- against HuntRelocDest (the pinned point), NOT the live target, so a
-            -- moving carrier cannot make this never settle; only a server pull-back
-            -- (which drags us away from the pinned point) counts as "not settled".
+            -- Verify the pin actually held (a server pull-back moves us away).
             local dest0 = Runtime.HuntRelocDest or spawn
             local settled = (now - (Runtime.HuntRelocAt or 0)) >= MOVE.RelocSettle
             if settled and (hrp0.Position - dest0).Magnitude <= MOVE.RelocArrive then
                 Runtime.HuntRelocDone = true
-                Runtime.HuntStage = (Runtime.HuntKind == "PLAYER") and "BAT" or "PICKUP"
+                Runtime.HuntStage = "PICKUP"
                 Runtime.HuntStageAt = now
             elseif now - (Runtime.HuntRelocAt or 0) >= MOVE.RelocRetry then
                 if (Runtime.HuntRelocTries or 0) >= MOVE.RelocMax then
@@ -4876,31 +4771,8 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                     Runtime.HuntRelocTries = (Runtime.HuntRelocTries or 0) + 1
                 end
             end
-            -- hard bound (respawn wait + RelocMax retries)
             if now - (Runtime.HuntRelocStart or now) > (MOVE.RelocRetry * (MOVE.RelocMax + 1) + 6) then
                 Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
-            end
-        elseif stage == "BAT" then
-            -- Spawned on the carrying player: huntLockStep hammers the bat at frame
-            -- rate until they drop the pet, then we go pick it up.
-            if kind ~= "PLAYER" then
-                Runtime.HuntStage = "PICKUP"; Runtime.HuntStageAt = now
-            else
-                local player = Runtime.HuntTarget
-                local pch = player and player.Character
-                local phrp = pch and pch:FindFirstChild("HumanoidRootPart")
-                if not (player and player.Parent and phrp) then
-                    Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
-                elseif inSafeZone(phrp.Position) then
-                    -- they banked it in the SafeZone: opportunity gone
-                    Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
-                elseif player:GetAttribute("Carrying") == nil then
-                    -- pet dropped: go grab it
-                    Runtime.HuntRecoverPick = nil
-                    Runtime.HuntStage = "PICKUP"; Runtime.HuntStageAt = now
-                elseif now - Runtime.HuntStageAt > (Config.GuardBaitTimeout or 20) then
-                    Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
-                end
             end
         elseif stage == "PICKUP" then
             if isCarrying() then
@@ -4916,7 +4788,12 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                 local pick = Runtime.HuntRecoverPick
                 if not pick or not pick.Parent or pick:GetAttribute("Despawning") then
                     pick = Runtime.huntPickupFor(pos, 120, Runtime.HuntCarried)
-                    if not pick then pick = findRecoverPickup(pos, Runtime.HuntCarried) end
+                    -- Far acquired drop: fall back to the exact target we latched in
+                    -- ACQUIRE, then walk toward it.
+                    if not pick then
+                        local d = Runtime.HuntDropTarget
+                        if d and d.Parent and not d:GetAttribute("Despawning") then pick = d end
+                    end
                     Runtime.HuntRecoverPick = pick
                 end
                 if pick then
@@ -4946,25 +4823,9 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                             Runtime.forcePickupInstant(pick)
                         end
                     end
-                else
-                    -- No drop at all: another player may have picked it up. Chase the
-                    -- new carrier at once (bat the real carrier) instead of idling.
-                    local carrier = findHuntCarrier(Runtime.HuntCarried, pos)
-                    if carrier then
-                        local cch = carrier.Character
-                        local chrp = cch and cch:FindFirstChild("HumanoidRootPart")
-                        Runtime.HuntKind = "PLAYER"
-                        Runtime.HuntTarget = carrier
-                        Runtime.HuntDropTarget = nil
-                        Runtime.HuntRecoverPick = nil
-                        Runtime.HuntGuardHits = 0
-                        Runtime.GuardHitAt = 0; Runtime.GuardHitState = nil
-                        Runtime.HuntSpawnPos = chrp and chrp.Position or pos
-                        Runtime.HuntStage = "BAT"; Runtime.HuntStageAt = now
-                        dbg("HUNT", "drop gone -> chase carrier " .. tostring(carrier.Name))
-                    end
-                end
-                if not isCarrying() and Runtime.HuntStage ~= "BAT" and now - Runtime.HuntStageAt > 2 then
+                elseif now - Runtime.HuntStageAt > 2 then
+                    -- Drop vanished (picked up by someone else / despawned): reset and
+                    -- let the outer selector acquire a fresh matching drop.
                     Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
                 end
             end
@@ -4979,7 +4840,7 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
             elseif now - Runtime.HuntStageAt > (Config.GuardBaitTimeout or 20) then
                 if isCarrying() then dropCarried() end
                 Runtime.HuntStage = "RESET"; Runtime.HuntStageAt = now
-            elseif not Runtime.HuntForcePin then
+            else
                 local zg = Runtime.nearestGuard(pos, Runtime.HuntPetZone) or Runtime.nearestGuard(pos)
                 if zg then
                     local gh = zg:FindFirstChild("HumanoidRootPart", true)
@@ -5220,7 +5081,19 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                                 if not travelActive() then walkTo(anchor, 3) end
                             elseif now - (Runtime.MetaAnchorTpAt or 0) > 0.5 then
                                 Runtime.MetaAnchorTpAt = now
-                                Runtime.instantTp(anchor)
+                                -- Never raw-TP into a zone whose content is not
+                                -- streamed yet (server pulls it back -> never loads).
+                                -- Wait for the stream; fall back to walking if it
+                                -- stalls, so the bot cannot dead-lock.
+                                if Runtime.zoneHasContent and Runtime.zoneHasContent(zoneId) then
+                                    Runtime.MetaStreamWaitAt = nil
+                                    Runtime.instantTp(anchor)
+                                else
+                                    Runtime.MetaStreamWaitAt = Runtime.MetaStreamWaitAt or now
+                                    if now - Runtime.MetaStreamWaitAt > 20 then
+                                        Runtime.MetaWalkEntry = true
+                                    end
+                                end
                             end
                         end
                     end
@@ -5287,7 +5160,19 @@ Connections.FeatureLoop = RunService.Heartbeat:Connect(function()
                                 if not travelActive() then walkTo(anchor, 3) end
                             elseif now - (Runtime.MetaAnchorTpAt or 0) > 0.5 then
                                 Runtime.MetaAnchorTpAt = now
-                                Runtime.instantTp(anchor)
+                                -- Never raw-TP into a zone whose content is not
+                                -- streamed yet (server pulls it back -> never loads).
+                                -- Wait for the stream; fall back to walking if it
+                                -- stalls, so the bot cannot dead-lock.
+                                if Runtime.zoneHasContent and Runtime.zoneHasContent(zoneId) then
+                                    Runtime.MetaStreamWaitAt = nil
+                                    Runtime.instantTp(anchor)
+                                else
+                                    Runtime.MetaStreamWaitAt = Runtime.MetaStreamWaitAt or now
+                                    if now - Runtime.MetaStreamWaitAt > 20 then
+                                        Runtime.MetaWalkEntry = true
+                                    end
+                                end
                             end
                             Runtime.MetaZoneWaitAt = nil
                         else
@@ -5926,17 +5811,7 @@ Connections.UnbindMetaKite = { Disconnect = function()
     pcall(function() RunService:UnbindFromRenderStep("BSMetaKite") end)
 end }
 
-----------------------------------------------------------------
--- AUTO STEAL PLAYER FORCE-FRONT LOCK (frame rate)
-----------------------------------------------------------------
-pcall(function()
-    RunService:BindToRenderStep("BSHuntLock", Enum.RenderPriority.Character.Value + 2, huntLockStep)
-end)
-Connections.UnbindHuntLock = { Disconnect = function()
-    pcall(function() RunService:UnbindFromRenderStep("BSHuntLock") end)
-end }
-
----------------------------------------------------------------
+--------------------------------------------------------------
 -- ANTI-CHEAT STRIKE DETECTOR (arm)
 ---------------------------------------------------------------
 armStrikeDetector()
@@ -5946,47 +5821,28 @@ armStrikeDetector()
 ----------------------------------------------------------------
 armGuardTrigger()
 
-----------------------------------------------------------------
--- SPAWN-PIN (self-kill ONCE per cycle -> respawn onto the target)
--- Serves HUNT (Auto Steal Player): fires on the planned RESPAWN relocation AND on
--- a mid-attempt death while reaching/stealing the target, to re-pin WITHOUT a
--- fresh self-respawn. The META pipeline no longer self-kills, so it is not used
--- there any more.
-----------------------------------------------------------------
+---------------------------------------------------------------
+-- DROP-ONLY HUNT SPAWN-PIN (self-kill ONCE -> respawn -> pin onto the DROP).
+---------------------------------------------------------------
 Connections.HuntCharAdded = LocalPlayer.CharacterAdded:Connect(function(ch)
-    -- The META pipeline no longer self-kills or respawn-pins, so only HUNT needs
-    -- the CharacterAdded relocation here.
     if Runtime.Phase ~= "HUNT" then return end
-    -- A mid-attempt death (killed at the pet) OR the planned self-respawn: hand the
-    -- fresh character to the RESPAWN stage's VERIFIED relocate. We deliberately do
-    -- NOT advance the stage to BAT/PICKUP here any more - the RESPAWN stage (re)issues
-    -- the pin and confirms arrival, so a server pull-back re-pins instead of leaving
-    -- us at the game's own spawn with no retry.
     local st = Runtime.HuntStage
-    local early = (st == "ACQUIRE" or st == "RESPAWN" or st == "BAT" or st == "PICKUP")
+    local early = (st == "ACQUIRE" or st == "RESPAWN" or st == "PICKUP")
     if not (Runtime.HuntRespawnPending or early) then return end
     Runtime.HuntRespawnPending = false
     -- A death already produced a fresh character, so never self-kill again this cycle.
     Runtime.HuntRespawned = true
-    -- latch the destination (LIVE target preferred; fall back to the ACQUIRE spot)
+    -- Latch the DROP destination (never a player).
     local p = nil
-    if Runtime.HuntKind == "PLAYER" then
-        local player = Runtime.HuntTarget
-        local tch = player and player.Character
-        local thrp = tch and tch:FindFirstChild("HumanoidRootPart")
-        p = thrp and thrp.Position
-    elseif Runtime.HuntKind == "DROP" then
-        local drop = Runtime.HuntDropTarget
-        if drop and drop.Parent then p = drop:GetPivot().Position end
-    end
+    local drop = Runtime.HuntDropTarget
+    if drop and drop.Parent then p = drop:GetPivot().Position end
     Runtime.HuntRelocPos = p or Runtime.HuntSpawnPos or Runtime.HuntPos
     Runtime.HuntRelocAt = 0
     Runtime.HuntRelocDone = false
     Runtime.HuntRelocStart = os.clock()
-    -- keep RESPAWN owning the relocate so its verify/retry runs
     Runtime.HuntStage = "RESPAWN"
     Runtime.HuntStageAt = os.clock()
-    -- immediate best-effort pin; the RESPAWN stage re-pins if the server pulls back
+    -- immediate best-effort pin; RESPAWN re-pins if the server pulls back
     task.spawn(function()
         local hrp = ch:FindFirstChild("HumanoidRootPart") or ch:WaitForChild("HumanoidRootPart", 3)
         if not hrp then return end
@@ -6612,6 +6468,28 @@ UIElements.EggFilter = TabAutoSteal:Dropdown({
     Default = Config.EggFilter,
     Callback = function(v) Config.EggFilter = v end,
 })
+UIElements.PetRarityFilter = TabAutoSteal:Dropdown({
+    Title = "Filter by Rarity",
+    Desc = "Only collect these rarities. Empty = all.",
+    Values = PET_RARITY_VALUES,
+    Value = {},
+    Default = {},
+    Multi = true,
+    AllowNone = true,
+    SearchBarEnabled = true,
+    Callback = function(selected)
+        local set = {}
+        if type(selected) == "table" then
+            for k, v in pairs(selected) do
+                local r = (type(v) == "string" and v) or (type(k) == "string" and k) or nil
+                if r then set[r] = true end
+            end
+        elseif type(selected) == "string" then
+            set[selected] = true
+        end
+        Config.PetRarityFilter = set
+    end,
+})
 UIElements.EggPriority = TabAutoSteal:Dropdown({
     Title = "Egg Priority",
     Desc = "Which egg to target when several are in range.",
@@ -6642,12 +6520,49 @@ UIElements.EggType = TabAutoSteal:Dropdown({
         Config.EggTypeFilter = set
     end,
 })
-UIElements.AutoTitanicEgg = TabAutoSteal:Toggle({
-    Title = "Auto Titanic Egg",
-    Desc = "On = prioritize the Titanic Egg wherever it spawns. Off = fully ignore it.",
-    Value = Config.AutoTitanicEgg,
-    Callback = function(v) Config.AutoTitanicEgg = v end,
-})
+do
+    -- Mutation values straight from the game's own MutationConfig: the fixed
+    -- mutations plus the weather-driven ones. "None" = pets with no Mutation.
+    local MUTATION_VALUES = { "None" }
+    pcall(function()
+        local MC = require(ReplicatedStorage.Shared.MutationConfig)
+        local seen = { None = true }
+        local function add(list)
+            if type(list) ~= "table" then return end
+            for _, m in ipairs(list) do
+                local n = type(m) == "table" and m.Name or nil
+                if type(n) == "string" and n ~= "" and not seen[n] then
+                    seen[n] = true
+                    MUTATION_VALUES[#MUTATION_VALUES + 1] = n
+                end
+            end
+        end
+        add(MC.Mutations)
+        add(MC.WeatherMutations)
+    end)
+    UIElements.MutationFilter = TabAutoSteal:Dropdown({
+        Title = "Filter by Mutation",
+        Desc = "Only collect these mutations. Empty = all.",
+        Values = MUTATION_VALUES,
+        Value = {},
+        Default = {},
+        Multi = true,
+        AllowNone = true,
+        SearchBarEnabled = true,
+        Callback = function(selected)
+            local set = {}
+            if type(selected) == "table" then
+                for k, v in pairs(selected) do
+                    local name = (type(v) == "string" and v) or (type(k) == "string" and k) or nil
+                    if name then set[name] = true end
+                end
+            elseif type(selected) == "string" then
+                set[selected] = true
+            end
+            Config.MutationFilter = set
+        end,
+    })
+end
 -- Normalize any legacy saved "TP" to "TP v2" so the dropdown always shows a valid item.
 if Config.MovementMode == "TP" then Config.MovementMode = "TP v2" end
 UIElements.MovementMode = TabAutoSteal:Dropdown({
@@ -6659,7 +6574,7 @@ UIElements.MovementMode = TabAutoSteal:Dropdown({
     Callback = function(v)
         Config.MovementMode = v
         if v == "Walk" then
-            -- Walk is the Auto Break engine; Auto Steal Player (HUNT) belongs to TP.
+            -- Walk is the Auto Break engine; Auto Steal (Drop) belongs to TP.
             if Config.AutoStealPlayer then
                 Config.AutoStealPlayer = false
                 setUIElementValue(UIElements.AutoStealPlayer, false)
@@ -6668,35 +6583,19 @@ UIElements.MovementMode = TabAutoSteal:Dropdown({
         if Runtime.syncWalkNoClip then Runtime.syncWalkNoClip() end
     end,
 })
+UIElements.AutoTitanicEgg = TabAutoSteal:Toggle({
+    Title = "Auto Titanic Egg",
+    Desc = "On = prioritize the Titanic Egg wherever it spawns. Off = fully ignore it.",
+    Value = Config.AutoTitanicEgg,
+    Callback = function(v) Config.AutoTitanicEgg = v end,
+})
 UIElements.AutoStealPlayer = TabAutoSteal:Toggle({
-    Title = "Auto Steal Player",
-    Desc = "Auto steal pet from player in zone.",
+    Title = "Auto Steal (Drop)",
+    Desc = "Auto steal pets dropped on the ground (no player chasing).",
     Value = Config.AutoStealPlayer,
     Callback = function(v)
         Config.AutoStealPlayer = v
         if not v then Runtime.autoSwing(false) end
-    end,
-})
-UIElements.PetRarityFilter = TabAutoSteal:Dropdown({
-    Title = "Filter by Rarity",
-    Desc = "Collect only these rarities (Auto Break + Auto Steal Player). None selected = all.",
-    Values = PET_RARITY_VALUES,
-    Value = {},
-    Default = {},
-    Multi = true,
-    AllowNone = true,
-    SearchBarEnabled = true,
-    Callback = function(selected)
-        local set = {}
-        if type(selected) == "table" then
-            for k, v in pairs(selected) do
-                local r = (type(v) == "string" and v) or (type(k) == "string" and k) or nil
-                if r then set[r] = true end
-            end
-        elseif type(selected) == "string" then
-            set[selected] = true
-        end
-        Config.PetRarityFilter = set
     end,
 })
 TabAutoSteal:Section({ Title = "Help Other Player", Icon = "hand-heart" })
@@ -6746,6 +6645,41 @@ UIElements.AutoUpgradePickaxe = TabUpgrade:Toggle({
     Value = Config.AutoUpgradePickaxe,
     Callback = function(v) Config.AutoUpgradePickaxe = v end,
 })
+do
+    -- Values come from the game's own PickaxeConfig.Tiers (ascending tier order).
+    local PICKAXE_VALUES = {}
+    pcall(function()
+        local PC = require(ReplicatedStorage.Shared.PickaxeConfig)
+        for _, t in ipairs((PC and PC.Tiers) or {}) do
+            local n = (type(t) == "table" and t.Name) or nil
+            if type(n) == "string" and n ~= "" then
+                PICKAXE_VALUES[#PICKAXE_VALUES + 1] = n
+            end
+        end
+    end)
+    UIElements.PickaxeUpgradeFilter = TabUpgrade:Dropdown({
+        Title = "Filter Pickaxe Upgrade",
+        Desc = "Only buy the pickaxes you select here. Empty = do not upgrade.",
+        Values = PICKAXE_VALUES,
+        Value = {},
+        Default = {},
+        Multi = true,
+        AllowNone = true,
+        SearchBarEnabled = true,
+        Callback = function(selected)
+            local set = {}
+            if type(selected) == "table" then
+                for k, v in pairs(selected) do
+                    local name = (type(v) == "string" and v) or (type(k) == "string" and k) or nil
+                    if name then set[name] = true end
+                end
+            elseif type(selected) == "string" then
+                set[selected] = true
+            end
+            Config.PickaxeUpgradeFilter = set
+        end,
+    })
+end
 UIElements.AutoUpgradeTreadmill = TabUpgrade:Toggle({
     Title = "Auto Upgrade Treadmill",
     Desc = "Auto upgrade the treadmill with cash.",
@@ -7118,6 +7052,12 @@ UIElements.AutoClaimIndex = TabMisc:Toggle({
         local UI = ctx.UIElements
         if cfg.EggTypeFilter ~= nil and UI.EggType then
             table.insert(queue, { element = UI.EggType, value = cfg.EggTypeFilter })
+        end
+        if cfg.PickaxeUpgradeFilter ~= nil and UI.PickaxeUpgradeFilter then
+            table.insert(queue, { element = UI.PickaxeUpgradeFilter, value = cfg.PickaxeUpgradeFilter })
+        end
+        if cfg.MutationFilter ~= nil and UI.MutationFilter then
+            table.insert(queue, { element = UI.MutationFilter, value = cfg.MutationFilter })
         end
         if cfg.AutoStealMinIncome ~= nil then
             local v = cfg.AutoStealMinIncome
