@@ -438,14 +438,11 @@ if userBtn and userBtn.Parent then
     local discordBtn = Instance.new("TextButton")
     discordBtn.Name = "Roox_JoinDiscordBtn" discordBtn.Size = UDim2.new(0, 186, 0, 32)
     discordBtn.Position = UDim2.new(0, 7, 1, -68) discordBtn.AnchorPoint = Vector2.new(0, 1)
-    discordBtn.BackgroundColor3 = Color3.fromRGB(20, 45, 95) discordBtn.Text = "JOIN DISCORD"
+    discordBtn.BackgroundColor3 = Color3.fromRGB(20, 48, 105) discordBtn.Text = "JOIN DISCORD"
     discordBtn.TextColor3 = Color3.fromRGB(255, 255, 255) discordBtn.Font = Enum.Font.GothamBold
     discordBtn.TextSize = 12 discordBtn.AutoButtonColor = true
     Instance.new("UICorner", discordBtn).CornerRadius = UDim.new(0, 8)
-    local dStroke = Instance.new("UIStroke") dStroke.Color = Color3.fromRGB(35, 80, 160) dStroke.Thickness = 1 dStroke.Parent = discordBtn
-    local dGradient = Instance.new("UIGradient")
-    dGradient.Color = ColorSequence.new(Color3.fromRGB(25, 60, 135), Color3.fromRGB(12, 28, 65))
-    dGradient.Rotation = 45 dGradient.Parent = discordBtn
+    local dStroke = Instance.new("UIStroke") dStroke.Color = Color3.fromRGB(35, 75, 150) dStroke.Thickness = 1 dStroke.Parent = discordBtn
     discordBtn.MouseButton1Click:Connect(function()
         copyToClipboard(DISCORD_INVITE)
         WindUI:Notify({ Title = "RooxHub • Discord", Content = "Discord link copied to clipboard.", Duration = 3 })
